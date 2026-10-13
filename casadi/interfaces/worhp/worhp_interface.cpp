@@ -28,6 +28,10 @@
 #include "casadi/core/casadi_misc.hpp"
 #include <ctime>
 #include <cstring>
+#include <cstdio>
+#ifdef _WIN32
+#include <share.h>
+#endif
 
 namespace casadi {
 
@@ -60,7 +64,12 @@ namespace casadi {
   = {{&Nlpsol::options_},
      {{"worhp",
        {OT_DICT,
-        "Options to be passed to WORHP"}}
+        "Options to be passed to WORHP"}},
+      {"output_file",
+       {OT_STRING,
+        "Write the WORHP output to this file instead of the console. "
+        "The file is flushed after each line and can be read during the solve, "
+        "e.g. in an iteration callback."}}
      }
   };
 
@@ -81,6 +90,8 @@ namespace casadi {
     for (auto&& op : opts) {
       if (op.first=="worhp") {
         worhp_opts = op.second;
+      } else if (op.first=="output_file") {
+        output_file_ = op.second.to_string();
       }
     }
 
@@ -135,7 +146,34 @@ namespace casadi {
     alloc_w(nx_); // for fetching diagonal entries form Hessian
   }
 
+  // Target of worhp_disp during a solve with output_file. SetWorhpPrint takes no user data,
+  // so the file is per thread: parallel solves in different threads write to their own files.
+  thread_local FILE* worhp_output_file = nullptr;
+
+  void worhp_close_output_file() {
+    if (worhp_output_file) {
+      fclose(worhp_output_file);
+      worhp_output_file = nullptr;
+    }
+  }
+
+  void worhp_open_output_file(const std::string& fname) {
+    worhp_close_output_file();
+#ifdef _WIN32
+    // Allow other processes to read the file during the solve
+    worhp_output_file = _fsopen(fname.c_str(), "w", _SH_DENYNO);
+#else
+    worhp_output_file = fopen(fname.c_str(), "w");
+#endif
+    casadi_assert(worhp_output_file, "WorhpInterface: cannot open output_file '" + fname + "'.");
+  }
+
   void worhp_disp(int mode, const char message[]) {
+    if (worhp_output_file) {
+      fprintf(worhp_output_file, "%s\n", message);
+      fflush(worhp_output_file);
+      return;
+    }
     if (mode & WORHP_PRINT_MESSAGE) {
       uout() << message << std::endl;
     }
@@ -265,6 +303,14 @@ namespace casadi {
     // Set work in base classes
     Nlpsol::set_work(mem, arg, res, iw, w);
 
+    // Redirect the WORHP output already here: WorhpInit prints the license information at
+    // the first call. The file stays open until the end of solve.
+    if (output_file_.empty()) {
+      worhp_close_output_file();
+    } else {
+      worhp_open_output_file(output_file_);
+    }
+
     // Free existing Worhp memory (except parameters)
     m->worhp_p.initialised = false; // Avoid freeing the memory for parameters
     if (m->worhp_o.initialised || m->worhp_w.initialised || m->worhp_c.initialised) {
@@ -385,6 +431,11 @@ namespace casadi {
       if (m->worhp_o.GL[i]==-inf) m->worhp_o.GL[i] = -m->worhp_p.Infty;
     for (casadi_int i=0; i<ng_; ++i)
       if (m->worhp_o.GU[i]== inf) m->worhp_o.GU[i] =  m->worhp_p.Infty;
+
+    // Output file opened in set_work, closed when leaving solve (also on exceptions)
+    struct OutputFileGuard {
+      ~OutputFileGuard() { worhp_close_output_file(); }
+    } output_file_guard;
 
     if (verbose_) casadi_message("WorhpInterface::starting iteration");
 
@@ -601,24 +652,26 @@ namespace casadi {
   }
 
   WorhpInterface::WorhpInterface(DeserializingStream& s) : Nlpsol(s) {
-    s.version("WorhpInterface", 1);
+    int version = s.version("WorhpInterface", 1, 2);
     s.unpack("WorhpInterface::jacg_sp", jacg_sp_);
     s.unpack("WorhpInterface::hesslag_sp", hesslag_sp_);
     s.unpack("WorhpInterface::bool_opts", bool_opts_);
     s.unpack("WorhpInterface::int_opts", int_opts_);
     s.unpack("WorhpInterface::double_opts", double_opts_);
     s.unpack("WorhpInterface::qp_opts", qp_opts_);
+    if (version >= 2) s.unpack("WorhpInterface::output_file", output_file_);
   }
 
   void WorhpInterface::serialize_body(SerializingStream &s) const {
     Nlpsol::serialize_body(s);
-    s.version("WorhpInterface", 1);
+    s.version("WorhpInterface", 2);
     s.pack("WorhpInterface::jacg_sp", jacg_sp_);
     s.pack("WorhpInterface::hesslag_sp", hesslag_sp_);
     s.pack("WorhpInterface::bool_opts", bool_opts_);
     s.pack("WorhpInterface::int_opts", int_opts_);
     s.pack("WorhpInterface::double_opts", double_opts_);
     s.pack("WorhpInterface::qp_opts", qp_opts_);
+    s.pack("WorhpInterface::output_file", output_file_);
   }
 
 } // namespace casadi
