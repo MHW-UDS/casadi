@@ -1,0 +1,19 @@
+=== Commit 1 ===
+WORHP: fix iteration_callback never being called (#4053)
+
+The callback was guarded by `if (!firstIteration)` with firstIteration
+initialised to true and never reset, so it was dead code. Evaluate the
+callback at every iterOutput action and handle errors like the Ipopt
+interface (nonzero return, KeyboardInterrupt, ignore_errors option).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+=== Commit 2 ===
+WORHP: report iter_count, iter_minor, inf_pr, inf_du in stats
+
+get_stats only reported return_status. Store MajorIter, MinorIter,
+NormMax_CV and OptiMax after the solve and add them to the stats.
+inf_du was read from the boolean parameter worhp_p.ScaledKKT; use
+worhp_w.OptiMax instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

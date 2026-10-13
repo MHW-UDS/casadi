@@ -1,0 +1,47 @@
+diff --git a/+casadi/Opti.m b/+casadi/Opti.m
+index 9392749..93650fd 100644
+--- a/+casadi/Opti.m
++++ b/+casadi/Opti.m
+@@ -1718,7 +1718,7 @@ classdef  Opti < casadi.PrintableCommon & casadi.SharedObject & SwigRef
+     end
+ 
+       function out = variable(self, varargin)
+-        st = dbstack('-completenames',1);
++        st = casadi.Opti.ascii_stacktrace(dbstack('-completenames',1)); % PATCH (non-ASCII paths)
+         if length(st)>0
+           meta = struct('stacktrace', {num2cell(st)});
+         else
+@@ -1728,7 +1728,7 @@ classdef  Opti < casadi.PrintableCommon & casadi.SharedObject & SwigRef
+         self.update_user_dict(out, meta);
+       end
+       function out = parameter(self, varargin)
+-        st = dbstack('-completenames',1);
++        st = casadi.Opti.ascii_stacktrace(dbstack('-completenames',1)); % PATCH (non-ASCII paths)
+         if length(st)>0
+           meta = struct('stacktrace', {num2cell(st)});
+         else
+@@ -1742,7 +1742,7 @@ classdef  Opti < casadi.PrintableCommon & casadi.SharedObject & SwigRef
+           self.internal_subject_to();
+           return;
+         end
+-        st = dbstack('-completenames',1);
++        st = casadi.Opti.ascii_stacktrace(dbstack('-completenames',1)); % PATCH (non-ASCII paths)
+         if length(st)>0
+           meta = struct('stacktrace', {num2cell(st)});
+         else
+@@ -1785,4 +1785,15 @@ classdef  Opti < casadi.PrintableCommon & casadi.SharedObject & SwigRef
+   end
+   methods(Static)
+   end
++  methods(Static, Hidden)
++    function st = ascii_stacktrace(st)
++      % PATCH (non-ASCII paths): mxGetString fails on non-ASCII characters
++      % ("mxGetString returned NULL"), so clear the file path in that case.
++      for k = 1:numel(st)
++        if any(double(st(k).file) > 127)
++          st(k).file = '';
++        end
++      end
++    end
++  end
+ end
