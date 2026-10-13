@@ -32,6 +32,14 @@
 
 namespace casadi {
 
+  /** \brief Memory of a Map: per-element solver statistics of the last evaluation */
+  struct CASADI_EXPORT MapMemory : public FunctionMemory {
+    // Statistics reported by the innermost solver (Nlpsol) for each element
+    std::vector<Dict> stats;
+    // Wall time of each element [s]
+    std::vector<double> t_wall;
+  };
+
   /** Evaluate in parallel
       \author Joel Andersson
       \date 2015
@@ -56,6 +64,15 @@ namespace casadi {
 
         \identifier{h4} */
     bool is_a(const std::string& type, bool recursive) const override;
+
+    /// Create memory block (holds per-element statistics)
+    void* alloc_mem() const override { return new MapMemory(); }
+
+    /// Free memory block
+    void free_mem(void *mem) const override { delete static_cast<MapMemory*>(mem); }
+
+    /// Per-element statistics of the last evaluation (arrays with one entry per element)
+    Dict get_stats(void* mem) const override;
 
     // Get list of dependency functions
     virtual std::vector<std::string> get_function() const override;

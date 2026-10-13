@@ -25,6 +25,9 @@
 
 #include "map.hpp"
 #include "serializing_stream.hpp"
+#include <chrono>
+#include <limits>
+#include <set>
 
 #ifdef CASADI_WITH_THREAD
 #ifdef CASADI_WITH_THREAD_MINGW
@@ -35,6 +38,69 @@
 #endif // CASADI_WITH_THREAD
 
 namespace casadi {
+
+  // Set by Map around the evaluation of each element. The innermost Nlpsol
+  // writes its statistics here at the end of eval (see nlpsol.cpp).
+  static thread_local Dict* map_stats_sink = nullptr;
+
+  // Accessor used by nlpsol.cpp (an extern thread_local would emit a weak TLS-init
+  // reference that is broken for MinGW DLLs)
+  Dict* get_map_stats_sink() { return map_stats_sink; }
+
+  namespace {
+    // RAII: route solver statistics and wall time of one element into the Map memory
+    struct MapStatsCapture {
+      Dict* prev_;
+      double* t_wall_;
+      std::chrono::steady_clock::time_point t0_;
+      MapStatsCapture(Dict* sink, double* t_wall)
+        : prev_(map_stats_sink), t_wall_(t_wall), t0_(std::chrono::steady_clock::now()) {
+        map_stats_sink = sink;
+      }
+      ~MapStatsCapture() {
+        *t_wall_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_).count();
+        map_stats_sink = prev_;
+      }
+    };
+  } // namespace
+
+  Dict Map::get_stats(void* mem) const {
+    Dict stats = FunctionInternal::get_stats(mem);
+    auto *m = static_cast<MapMemory*>(mem);
+
+    // Union of all keys reported by the elements
+    std::set<std::string> keys;
+    for (const Dict& d : m->stats) {
+      for (const auto& e : d) keys.insert(e.first);
+    }
+
+    // One array per key: numbers as vector<double> (NaN if an element lacks it),
+    // strings as vector<string>. Other types (nested dicts, ...) are skipped.
+    for (const std::string& k : keys) {
+      const GenericType* first = nullptr;
+      for (const Dict& d : m->stats) {
+        auto it = d.find(k);
+        if (it != d.end()) { first = &it->second; break; }
+      }
+      if (first->is_bool() || first->is_int() || first->is_double()) {
+        std::vector<double> v(m->stats.size(), std::numeric_limits<double>::quiet_NaN());
+        for (size_t i = 0; i < m->stats.size(); ++i) {
+          auto it = m->stats[i].find(k);
+          if (it != m->stats[i].end()) v[i] = it->second.to_double();
+        }
+        stats[k] = v;
+      } else if (first->is_string()) {
+        std::vector<std::string> v(m->stats.size());
+        for (size_t i = 0; i < m->stats.size(); ++i) {
+          auto it = m->stats[i].find(k);
+          if (it != m->stats[i].end()) v[i] = it->second.to_string();
+        }
+        stats[k] = v;
+      }
+    }
+    stats["t_wall_element"] = m->t_wall;
+    return stats;
+  }
 
   Function Map::create(const std::string& parallelization, const Function& f, casadi_int n) {
     // Create instance of the right class
@@ -329,8 +395,31 @@ namespace casadi {
     // Could also use the thread-safe variant f_(arg1, res1, iw, w)
     // in Map::eval_gen
     setup(mem, arg, res, iw, w);
+    auto *mm = static_cast<MapMemory*>(mem);
+    mm->stats.assign(n_, Dict());
+    mm->t_wall.assign(n_, 0.0);
     scoped_checkout<Function> m(f_);
-    return eval_gen(arg, res, iw, w, m);
+
+    // Same as eval_gen, but with per-element statistics capture
+    const double** arg1 = arg+n_in_;
+    std::copy_n(arg, n_in_, arg1);
+    double** res1 = res+n_out_;
+    std::copy_n(res, n_out_, res1);
+    for (casadi_int i=0; i<n_; ++i) {
+      int ret;
+      {
+        MapStatsCapture capture(&mm->stats[i], &mm->t_wall[i]);
+        ret = f_(arg1, res1, iw, w, m);
+      }
+      if (ret) return 1;
+      for (casadi_int j=0; j<n_in_; ++j) {
+        if (arg1[j]) arg1[j] += f_.nnz_in(j);
+      }
+      for (casadi_int j=0; j<n_out_; ++j) {
+        if (res1[j]) res1[j] += f_.nnz_out(j);
+      }
+    }
+    return 0;
   }
 
   OmpMap::~OmpMap() {
@@ -450,7 +539,7 @@ namespace casadi {
   void ThreadsWork(const Function& f, casadi_int i,
       const double** arg, double** res,
       casadi_int* iw, double* w,
-      casadi_int ind, int& ret) {
+      casadi_int ind, int& ret, Dict& stats_out, double& t_wall_out) {
 
     // Function dimensions
     casadi_int n_in = f.n_in();
@@ -473,6 +562,7 @@ namespace casadi {
     }
 
     try {
+      MapStatsCapture capture(&stats_out, &t_wall_out);
       ret = f(arg1, res1, iw + i*sz_iw, w + i*sz_w, ind);
     } catch (std::exception& e) {
       ret = 1;
@@ -489,6 +579,9 @@ namespace casadi {
     return Map::eval(arg, res, iw, w, mem);
 #else // CASADI_WITH_THREAD
     setup(mem, arg, res, iw, w);
+    auto *mm = static_cast<MapMemory*>(mem);
+    mm->stats.assign(n_, Dict());
+    mm->t_wall.assign(n_, 0.0);
     // Checkout memory objects
     std::vector< scoped_checkout<Function> > ind; ind.reserve(n_);
     for (casadi_int i=0; i<n_; ++i) ind.emplace_back(f_);
@@ -504,10 +597,12 @@ namespace casadi {
       // using mingw-std-threads.
       threads.emplace_back(
         [i](const Function& f, const double** arg, double** res,
-            casadi_int* iw, double* w, casadi_int ind, int& ret) {
-              ThreadsWork(f, i, arg, res, iw, w, ind, ret);
+            casadi_int* iw, double* w, casadi_int ind, int& ret,
+            Dict& stats_out, double& t_wall_out) {
+              ThreadsWork(f, i, arg, res, iw, w, ind, ret, stats_out, t_wall_out);
             },
-        std::ref(f_), arg, res, iw, w, casadi_int(ind[i]), std::ref(ret_values[i]));
+        std::ref(f_), arg, res, iw, w, casadi_int(ind[i]), std::ref(ret_values[i]),
+        std::ref(mm->stats[i]), std::ref(mm->t_wall[i]));
     }
 
     // Join threads

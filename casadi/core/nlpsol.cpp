@@ -31,6 +31,11 @@
 #include <cctype>
 
 namespace casadi {
+  // Defined in map.cpp
+  Dict* get_map_stats_sink();
+}
+
+namespace casadi {
 
   bool has_nlpsol(const std::string& name) {
     return Nlpsol::has_plugin(name);
@@ -870,6 +875,9 @@ namespace casadi {
     casadi_copy(&d_nlp->objective, 1, d_nlp->f);
 
     if (m->success) m->unified_return_status = SOLVER_RET_SUCCESS;
+
+    // Hand statistics to an enclosing Map (per-element stats), see map.cpp
+    if (Dict* sink = get_map_stats_sink()) *sink = get_stats(m);
 
     if (error_on_fail_ && !m->success)
       casadi_error("nlpsol process failed. "
